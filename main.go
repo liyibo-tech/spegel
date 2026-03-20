@@ -37,7 +37,10 @@ type VersionCmd struct {
 }
 
 type ConfigurationCmd struct {
+	RuntimeKind                   string   `arg:"--runtime-kind,env:RUNTIME_KIND" default:"containerd" help:"Image runtime kind. Supported values: containerd, crio."`
 	ContainerdRegistryConfigPath string   `arg:"--containerd-registry-config-path,env:CONTAINERD_REGISTRY_CONFIG_PATH" default:"/etc/containerd/certs.d" help:"Directory where mirror configuration is written."`
+	CRIORegistriesConfPath       string   `arg:"--crio-registries-conf-path,env:CRIO_REGISTRIES_CONF_PATH" default:"/etc/containers/registries.conf" help:"CRI-O registries.conf path."`
+	CRIORegistriesConfDir        string   `arg:"--crio-registries-conf-dir,env:CRIO_REGISTRIES_CONF_DIR" default:"/etc/containers/registries.conf.d" help:"CRI-O registries.conf.d directory path."`
 	MirroredRegistries           []string `arg:"--mirrored-registries,env:MIRRORED_REGISTRIES" help:"Registries that are configured to be mirrored, if slice is empty all registires are mirrored."`
 	MirrorTargets                []string `arg:"--mirror-targets,env:MIRROR_TARGETS,required" help:"registries that are configured to act as mirrors."`
 	ResolveTags                  bool     `arg:"--resolve-tags,env:RESOLVE_TAGS" default:"true" help:"When true Spegel will resolve tags to digests."`
@@ -55,9 +58,12 @@ type BootstrapConfig struct {
 type RegistryCmd struct {
 	BootstrapConfig
 	MetricsAddr           string           `arg:"--metrics-addr,env:METRICS_ADDR" default:":9090" help:"address to serve metrics."`
+	RuntimeKind           string           `arg:"--runtime-kind,env:RUNTIME_KIND" default:"containerd" help:"Image runtime kind. Supported values: containerd, crio."`
 	ContainerdSock        string           `arg:"--containerd-sock,env:CONTAINERD_SOCK" default:"/run/containerd/containerd.sock" help:"Endpoint of containerd service."`
 	ContainerdNamespace   string           `arg:"--containerd-namespace,env:CONTAINERD_NAMESPACE" default:"k8s.io" help:"Containerd namespace to fetch images from."`
 	ContainerdContentPath string           `arg:"--containerd-content-path,env:CONTAINERD_CONTENT_PATH" default:"/var/lib/containerd/io.containerd.content.v1.content" help:"Path to Containerd content store"`
+	CRIOSock              string           `arg:"--crio-sock,env:CRIO_SOCK" default:"/var/run/crio/crio.sock" help:"Endpoint of CRI-O service."`
+	CRIOStoragePath       string           `arg:"--crio-storage-path,env:CRIO_STORAGE_PATH" default:"/var/lib/containers/storage" help:"Path to CRI-O storage root."`
 	DataDir               string           `arg:"--data-dir,env:DATA_DIR" default:"/var/lib/spegel" help:"Directory where Spegel persists data."`
 	RouterAddr            string           `arg:"--router-addr,env:ROUTER_ADDR" default:":5001" help:"address to serve router."`
 	RegistryAddr          string           `arg:"--registry-addr,env:REGISTRY_ADDR" default:":5000" help:"address to server image registry."`
@@ -70,7 +76,10 @@ type RegistryCmd struct {
 
 type CleanupCmd struct {
 	Addr                         string `arg:"--addr,required,env:ADDR" help:"address to run readiness probe on."`
+	RuntimeKind                  string `arg:"--runtime-kind,env:RUNTIME_KIND" default:"containerd" help:"Image runtime kind. Supported values: containerd, crio."`
 	ContainerdRegistryConfigPath string `arg:"--containerd-registry-config-path,env:CONTAINERD_REGISTRY_CONFIG_PATH" default:"/etc/containerd/certs.d" help:"Directory where mirror configuration is written."`
+	CRIORegistriesConfPath       string `arg:"--crio-registries-conf-path,env:CRIO_REGISTRIES_CONF_PATH" default:"/etc/containers/registries.conf" help:"CRI-O registries.conf path."`
+	CRIORegistriesConfDir        string `arg:"--crio-registries-conf-dir,env:CRIO_REGISTRIES_CONF_DIR" default:"/etc/containers/registries.conf.d" help:"CRI-O registries.conf.d directory path."`
 }
 
 type CleanupWaitCmd struct {
@@ -164,7 +173,18 @@ func configurationCommand(ctx context.Context, args *ConfigurationCmd) error {
 	if err != nil {
 		return err
 	}
-	err = oci.AddMirrorConfiguration(ctx, args.ContainerdRegistryConfigPath, args.MirroredRegistries, args.MirrorTargets, args.ResolveTags, args.PrependExisting, username, password)
+	err = oci.ConfigureMirrors(ctx, oci.MirrorConfigRequest{
+		RuntimeKind:             args.RuntimeKind,
+		ContainerdConfigPath:    args.ContainerdRegistryConfigPath,
+		CRIORegistriesConfPath:  args.CRIORegistriesConfPath,
+		CRIORegistriesConfDir:   args.CRIORegistriesConfDir,
+		MirroredRegistries:      args.MirroredRegistries,
+		MirrorTargets:           args.MirrorTargets,
+		ResolveTags:             args.ResolveTags,
+		PrependExisting:         args.PrependExisting,
+		Username:                username,
+		Password:                password,
+	})
 	if err != nil {
 		return err
 	}
@@ -206,11 +226,25 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 	}
 
 	// OCI Store
-	ociStore, err := oci.NewContainerd(ctx, args.ContainerdSock, args.ContainerdNamespace, oci.WithContentPath(args.ContainerdContentPath))
-	if err != nil {
-		return err
+	var ociStore oci.Store
+	switch args.RuntimeKind {
+	case oci.RuntimeKindContainerd:
+		containerdStore, err := oci.NewContainerd(ctx, args.ContainerdSock, args.ContainerdNamespace, oci.WithContentPath(args.ContainerdContentPath))
+		if err != nil {
+			return err
+		}
+		defer containerdStore.Close()
+		ociStore = containerdStore
+	case oci.RuntimeKindCRIO:
+		crioStore, err := oci.NewCRIO(ctx, args.CRIOSock, args.CRIOStoragePath)
+		if err != nil {
+			return err
+		}
+		defer crioStore.Close()
+		ociStore = crioStore
+	default:
+		return fmt.Errorf("unsupported runtime kind %q", args.RuntimeKind)
 	}
-	defer ociStore.Close()
 
 	// Router
 	_, registryPort, err := net.SplitHostPort(args.RegistryAddr)
@@ -328,7 +362,12 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 }
 
 func cleanupCommand(ctx context.Context, args *CleanupCmd) error {
-	err := cleanup.Run(ctx, args.Addr, args.ContainerdRegistryConfigPath)
+	err := cleanup.Run(ctx, args.Addr, cleanup.Config{
+		RuntimeKind:             args.RuntimeKind,
+		ContainerdConfigPath:    args.ContainerdRegistryConfigPath,
+		CRIORegistriesConfPath:  args.CRIORegistriesConfPath,
+		CRIORegistriesConfDir:   args.CRIORegistriesConfDir,
+	})
 	if err != nil {
 		return err
 	}

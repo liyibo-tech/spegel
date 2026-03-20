@@ -16,10 +16,22 @@ import (
 	"github.com/spegel-org/spegel/pkg/oci"
 )
 
-func Run(ctx context.Context, addr, configPath string) error {
+type Config struct {
+	RuntimeKind            string
+	ContainerdConfigPath   string
+	CRIORegistriesConfPath string
+	CRIORegistriesConfDir  string
+}
+
+func Run(ctx context.Context, addr string, cfg Config) error {
 	log := logr.FromContextOrDiscard(ctx)
 
-	err := oci.CleanupMirrorConfiguration(ctx, configPath)
+	err := oci.CleanupMirrors(ctx, oci.MirrorCleanupRequest{
+		RuntimeKind:            cfg.RuntimeKind,
+		ContainerdConfigPath:   cfg.ContainerdConfigPath,
+		CRIORegistriesConfPath: cfg.CRIORegistriesConfPath,
+		CRIORegistriesConfDir:  cfg.CRIORegistriesConfDir,
+	})
 	if err != nil {
 		return err
 	}
